@@ -191,8 +191,8 @@ class CompositionDatasetActivations(torch.utils.data.Dataset):
 
 class CompositionDatasetActivationsGenerator(CompositionDatasetActivations):
 
-    def __init__(self, root, feat_file, split='compositional-split', feat_extractor=None, transform_type='normal'):
-        super(CompositionDatasetActivationsGenerator, self).__init__(root, 'train', None, split, transform_type=transform_type)
+    def __init__(self, root, feat_file, split='compositional-split-natural', feat_extractor=None, transform_type='normal'):
+        super(CompositionDatasetActivationsGenerator, self).__init__(name=None, root=root, phase='train', feat_file=None,split=split, transform_type=transform_type)
 
         assert os.path.exists(root)
         with torch.no_grad():
@@ -200,7 +200,7 @@ class CompositionDatasetActivationsGenerator(CompositionDatasetActivations):
         print('Features generated.')
 
     def get_split_info(self):
-        data = torch.load(self.root+'/metadata.t7')
+        data = torch.load(self.root+'/metadata_'+self.split+'.t7')
         train_pair_set = set(self.train_pairs)
         test_pair_set = set(self.test_pairs)
         train_data, val_data, test_data = [], [], []
@@ -241,7 +241,7 @@ class CompositionDatasetActivationsGenerator(CompositionDatasetActivations):
         image_feats = []
         image_files = []
         for chunk in tqdm.tqdm(data_utils.chunks(data, 512), total=len(data)//512):
-            files = zip(*chunk)[0]
+            files = list(zip(*chunk))[0]
             imgs = list(map(self.loader, files))
             imgs = list(map(transform, imgs))
             feats = feat_extractor(torch.stack(imgs, 0).cuda())
@@ -272,6 +272,7 @@ if __name__=='__main__':
     
 
     CompositionDatasetActivationsGenerator(
+        # phase = 'test'
         root = 'data/%s-natural'%name, 
         feat_file = 'data/%s-natural/features.t7'%name,
     )

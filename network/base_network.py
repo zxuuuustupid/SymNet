@@ -1,209 +1,171 @@
-import tensorflow as tf
-import tensorflow.contrib.slim as slim
-from tensorflow.python import pywrap_tensorflow
-from tensorflow.python.ops import array_ops
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import os, logging, torch
 
 
-
-class BaseNetwork(object):
-    def logger(self, suffix):
-        return self.root_logger.getChild(suffix)
-
+class BaseNetwork(nn.Module):
     def __init__(self, dataloader, args, feat_dim=None):
+        super(BaseNetwork, self).__init__()
+
         self.dataloader = dataloader
         self.num_attr = len(dataloader.dataset.attrs)
         self.num_obj = len(dataloader.dataset.objs)
+
         if feat_dim is not None:
             self.feat_dim = feat_dim
         else:
             self.feat_dim = dataloader.dataset.feat_dim
 
         self.args = args
-        self.dropout = args.dropout
-        
+        self.dropout = args.dropout if hasattr(args, 'dropout') else None
 
-        if self.args.loss_class_weight and self.args.data not in ['SUN','APY']:
+        if getattr(self.args, 'loss_class_weight', False) and self.args.data not in ['SUN', 'APY']:
             from utils.aux_data import load_loss_weight
             self.num_pair = len(dataloader.dataset.pairs)
-            
-            attr_weight, obj_weight, pair_weight = load_loss_weight(self.args.data)
-            self.attr_weight = np.array(attr_weight, dtype=np.float32)
-            self.obj_weight  = np.array(obj_weight, dtype=np.float32)
-            self.pair_weight = np.array(pair_weight, dtype=np.float32)
 
+            attr_weight, obj_weight, pair_weight = load_loss_weight(self.args.data)
+            self.attr_weight = torch.tensor(attr_weight, dtype=torch.float32)
+            self.obj_weight = torch.tensor(obj_weight, dtype=torch.float32)
+            self.pair_weight = torch.tensor(pair_weight, dtype=torch.float32)
         else:
             self.attr_weight = None
-            self.obj_weight  = None
+            self.obj_weight = None
             self.pair_weight = None
-        
 
-    def basic_argscope(self, is_training):
-        activation_list = {
-            'relu': tf.nn.relu,
-            'elu': tf.nn.elu,
-        }
-        if hasattr(tf.nn, "leaky_relu"):
-            activation_list['leaky_relu'] = tf.nn.leaky_relu
-        if hasattr(tf.nn, "relu6"):
-            activation_list['relu6'] = tf.nn.relu6
+        # 这里演示定义一个简单MLP作为示例，你实际用法可以继承或替换
+        # 输入维度是feat_dim，输出是num_attr + num_obj，具体看需求
+        self.mlp = self._make_mlp(self.feat_dim, [512, 256], self.num_attr + self.num_obj)
 
-        if self.args.initializer is None:
-            initializer = tf.contrib.layers.xavier_initializer()
-        else:
-            initializer = tf.random_normal_initializer(0, self.args.initializer)
+        # 你可以根据需要定义其他模块、参数
 
-        return slim.arg_scope(
-            [slim.fully_connected],
-            activation_fn = activation_list[self.args.activation],
-            normalizer_fn = slim.batch_norm if self.args.batchnorm else None,
-            normalizer_params={
-                'is_training': is_training, 
-                'decay': 0.95, 
-                'fused':False
-            },
-        )
+    def _make_mlp(self, input_dim, hidden_layers, output_dim):
+        layers = []
+        in_dim = input_dim
+        for h in hidden_layers:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU(inplace=True))
+            if self.dropout is not None:
+                layers.append(nn.Dropout(p=1 - self.dropout))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, output_dim))
+        return nn.Sequential(*layers)
 
+    def forward(self, x):
+        # x: 输入特征 tensor [batch_size, feat_dim]
+        out = self.mlp(x)  # [batch_size, num_attr + num_obj]
 
-    def MLP(self, input_feat, output_dim, is_training, name, hidden_layers=[]):
-        """multi-layer perceptron, 1 layers as default"""
+        # 假设前半部分是attr预测，后半部分是obj预测
+        attr_pred = out[:, :self.num_attr]
+        obj_pred = out[:, self.num_attr:]
 
-        with self.basic_argscope(is_training):
-            with tf.variable_scope(name) as scope:
-                for i, size in enumerate(hidden_layers):
-                    input_feat = slim.fully_connected(input_feat, size,
-                        trainable=is_training, reuse=tf.AUTO_REUSE, scope="fc_%d"%i)
-                        
-                    if self.dropout is not None:
-                        input_feat = slim.dropout(input_feat, keep_prob=self.dropout, is_training=is_training, scope='dropout_%d'%i)
+        # 你可以根据实际情况返回不同东西
+        return attr_pred, obj_pred
 
-                output_feat = slim.fully_connected(input_feat, output_dim,
-                    trainable=is_training, activation_fn=None, reuse=tf.AUTO_REUSE, scope="fc_out")
-            
-        return output_feat
-        
+    def cross_entropy(self, prob, labels, weight=None, sample_weight=None, neg_loss=0, focal_loss_gamma=None):
+        device = prob.device
+        labels_onehot = F.one_hot(labels, num_classes=prob.shape[1]).float()
+        return self.cross_entropy_with_labelvec(prob, labels_onehot, weight, sample_weight, neg_loss, focal_loss_gamma)
 
-    def cross_entropy(self, prob, labels, depth, target=1, weight=None, sample_weight=None, neg_loss=0):
-        """cross entropy with GT label id (int)"""
-        onehot_label = tf.one_hot(labels, depth=depth, axis=1)            # (bz, depth)
-        return self.cross_entropy_with_labelvec(prob, onehot_label, target=target, 
-            weight=weight, sample_weight=sample_weight, neg_loss=neg_loss)
-
-    def cross_entropy_with_labelvec(self, prob, label_vecs, target=1, weight=None, sample_weight=None, neg_loss=0, mask=None):
-        """cross entropy with GT onehot vector"""
-        assert target in [0,1]
+    def cross_entropy_with_labelvec(self, prob, label_vecs, weight=None, sample_weight=None, neg_loss=0, focal_loss_gamma=None, mask=None):
         epsilon = 1e-8
-        gamma = self.args.focal_loss
         alpha = neg_loss
+        gamma = focal_loss_gamma
 
-        zeros = array_ops.zeros_like(label_vecs, dtype=prob.dtype) # (bz, depth)
-        ones = array_ops.ones_like(label_vecs, dtype=prob.dtype) # (bz, depth)
+        pos_mask = label_vecs > 0
+        neg_mask = label_vecs == 0
 
-        if target == 0:
-            prob = 1-prob
+        pos_prob = torch.where(pos_mask, prob, torch.ones_like(prob))
+        neg_prob = torch.where(pos_mask, torch.zeros_like(prob), prob)
 
-        pos_position = label_vecs > array_ops.zeros_like(label_vecs, dtype=label_vecs.dtype)
-        pos_prob = array_ops.where(pos_position, prob, ones)  # pos -> p, neg -> 1 (no loss)
-        neg_prob = array_ops.where(pos_position, zeros, prob)  # pos -> 0(no loss), neg ->p
-
-
-        pos_xent = - tf.log(tf.clip_by_value(pos_prob, epsilon, 1.0))
+        pos_xent = -torch.log(pos_prob.clamp(min=epsilon))
         if gamma is not None:
-            pos_xent = ((1-pos_prob) ** gamma) * pos_xent
-        
-        if alpha is None or alpha == 0:
-            neg_xent = 0
-        else:
-            neg_xent = - alpha * tf.log(tf.clip_by_value(1.0 - neg_prob, epsilon, 1.0))
+            pos_xent = ((1 - pos_prob) ** gamma) * pos_xent
 
+        if alpha is None or alpha == 0:
+            neg_xent = torch.zeros_like(pos_xent)
+        else:
+            neg_xent = -alpha * torch.log((1 - neg_prob).clamp(min=epsilon))
             if gamma is not None:
                 neg_xent = (neg_prob ** gamma) * neg_xent
-        
-        xent = pos_xent + neg_xent   # (bz, depth)
+
+        xent = pos_xent + neg_xent
 
         if mask is not None:
-            xent = xent*mask
+            xent = xent * mask
 
         if sample_weight is not None:
-            xent = xent*tf.expand_dims(sample_weight, axis=1)
-        xent = tf.reduce_mean(xent, axis=0)  # (depth,)
+            xent = xent * sample_weight.unsqueeze(1)
+
+        xent = xent.mean(dim=0)
 
         if weight is not None:
-            xent = xent*weight
+            xent = xent * weight
 
-        return tf.reduce_sum(xent)
-    
-
+        return xent.sum()
 
     def distance_metric(self, a, b):
-        if (self.args.distance_metric == 'L2'):
-            return tf.norm(a-b, axis=-1)
-        elif (self.args.distance_metric == 'L1'):
-            return tf.norm(a-b, axis=-1, ord=1)
-        elif (self.args.distance_metric == 'cos'):
-            return tf.reduce_sum(
-                tf.multiply(
-                    tf.nn.l2_normalize(a,axis=-1), 
-                    tf.nn.l2_normalize(b,axis=-1)
-                ), axis=-1)
+        if self.args.distance_metric == 'L2':
+            return torch.norm(a - b, dim=-1)
+        elif self.args.distance_metric == 'L1':
+            return torch.norm(a - b, p=1, dim=-1)
+        elif self.args.distance_metric == 'cos':
+            a_norm = F.normalize(a, p=2, dim=-1)
+            b_norm = F.normalize(b, p=2, dim=-1)
+            return torch.sum(a_norm * b_norm, dim=-1)
         else:
-            raise NotImplementedError("Unsupported distance metric: %s" + \
-                self.args.distance_metric)
-        
-    def MSELoss(self, a, b):
-        return tf.reduce_mean(self.distance_metric(a, b))
+            raise NotImplementedError(f"Unsupported distance metric: {self.args.distance_metric}")
 
-    def carlibration_look_up(self, prob, transform_attr_onehot, gt=1, margin = 0.05):
+    def mse_loss(self, a, b):
+        return torch.mean(self.distance_metric(a, b))
+
+    def calibration_look_up(self, prob, transform_attr_onehot, gt=1, margin=0.05):
+        if not hasattr(self, 'att_sim'):
+            raise AttributeError("self.att_sim not defined")
+
         if gt == 1:
             prob_label_vec = self.att_sim
         elif gt == 0:
             prob_label_vec = 1 - self.att_sim
         else:
-            raise ValueError(gt)
-        if np.any(prob_label_vec < 0):
+            raise ValueError(f"gt should be 0 or 1 but got {gt}")
+
+        if (prob_label_vec < 0).any():
             prob_label_vec = prob_label_vec * 0.5 + 0.5
-        carlib_prob = tf.matmul(transform_attr_onehot, tf.cast(prob_label_vec, dtype=tf.float32))
-        prob_diff = tf.abs(prob - carlib_prob)
-        loss = tf.maximum(0., prob_diff - margin)
-        loss = tf.reduce_mean(tf.reduce_sum(loss, axis=1))
-        return loss
+
+        carlib_prob = torch.matmul(transform_attr_onehot.float(), prob_label_vec.float())
+        prob_diff = torch.abs(prob - carlib_prob)
+        loss = torch.clamp(prob_diff - margin, min=0)
+        return loss.mean()
 
     def triplet_margin_loss(self, anchor, positive, negative, weight=None, margin=None):
-        d1 = self.distance_metric(anchor,positive)
+        d1 = self.distance_metric(anchor, positive)
         d2 = self.distance_metric(anchor, negative)
         return self.triplet_margin_loss_with_distance(d1, d2, weight, margin)
 
-
     def triplet_margin_loss_with_distance(self, d1, d2, weight=None, margin=None):
         if margin is None:
-            margin = self.args.triplet_margin
+            margin = getattr(self.args, 'triplet_margin', 1.0)
         if weight is None:
             dist = d1 - d2 + margin
         else:
             dist = weight * (d1 - d2) + margin
-        return tf.maximum(dist, 0)
-    
-    def test_step(self, sess, blobs, score_op):
+        return torch.clamp(dist, min=0).mean()
+
+    def test_step(self, inputs, device):
         dset = self.dataloader.dataset
-        test_att = np.array([dset.attr2idx[attr] for attr, _ in dset.pairs])
-        test_obj = np.array([dset.obj2idx[obj] for _, obj in dset.pairs])
 
-        feed_dict = {
-            self.pos_image_feat: blobs[4],
-            self.test_attr_id: test_att,
-            self.test_obj_id:  test_obj,
-        }
-        if self.args.obj_pred is not None:
-            feed_dict[self.pos_obj_prediction] = blobs[-1]
+        test_att = torch.tensor([dset.attr2idx[attr] for attr, _ in dset.pairs], device=device)
+        test_obj = torch.tensor([dset.obj2idx[obj] for _, obj in dset.pairs], device=device)
 
-        score = sess.run(score_op, feed_dict=feed_dict)
+        pos_image_feat = inputs[4].to(device)
 
-        for key in score_op.keys():
-            score[key][0] = {
-                (a,o): torch.from_numpy(score[key][0][:,i])
-                for i,(a,o) in enumerate(zip(test_att, test_obj))
+        self.eval()
+        with torch.no_grad():
+            attr_pred, obj_pred = self.forward(pos_image_feat)
+            # 你可以在这里把attr_pred,obj_pred组合成score字典或其他格式
+            score = {
+                'attr_pred': attr_pred,
+                'obj_pred': obj_pred,
             }
-
         return score

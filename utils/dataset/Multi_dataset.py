@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 import argparse
 import tqdm
-import h5py
+# import h5py
 
 
 class MultiDatasetActivations(torch.utils.data.Dataset):

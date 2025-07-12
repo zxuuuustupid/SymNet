@@ -1,99 +1,85 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-
-import numpy as np
-import os, logging, torch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from collections import OrderedDict
-
-from network.base_network import *
-from utils.utils import Embedder
-from utils import config as cfg
-
+from network.base_network import BaseNetwork
+import logging
 
 
 class Network(BaseNetwork):
-    root_logger = logging.getLogger("network %s"%__file__)
+    root_logger = logging.getLogger("network")
 
     def __init__(self, dataloader, args, feat_dim=None):
         super(Network, self).__init__(dataloader, args, feat_dim)
 
-        self.pos_obj_id   = tf.placeholder(tf.int32, shape=[None])
-        self.pos_image_feat = tf.placeholder(tf.float32, shape=[None, self.feat_dim])
-        
-        self.test_attr_id   = tf.placeholder(tf.int32, shape=[None], name='test_attr_id')
-        self.test_obj_id    = tf.placeholder(tf.int32, shape=[None], name='test_obj_id')
-        self.lr = tf.placeholder(tf.float32)
-    
+        # 定义 MLP 分类器（用于训练和测试）
+        self.obj_classifier = self._make_mlp(self.feat_dim, args.fc_cls, self.num_obj)
+        # 用于tensorboard或记录loss
+        self.loss_log = []
+
+    def build_network(self, input_feats, obj_labels=None, test_only=False):
+        """
+        input_feats: torch.Tensor, shape = (B, feat_dim)
+        obj_labels: torch.Tensor, shape = (B,) 可选
+        test_only: bool
+        """
 
 
+        # logger = self.logger('create_train_arch')
+        batch_size = input_feats.size(0)
 
-    def build_network(self, test_only=False):
-        logger = self.logger('create_train_arch')
+        # 训练阶段 forward
+        score_pos_O = self.obj_classifier(input_feats)  # [B, num_obj]
+        prob_pos_O = F.softmax(score_pos_O, dim=1)
 
+        loss = None
+        if not test_only and obj_labels is not None:
+            loss = self.cross_entropy(prob_pos_O, obj_labels, weight=self.obj_weight.to(input_feats.device))
 
-        ########################## classifier losses ##########################
-        score_pos_O = self.MLP(self.pos_image_feat, self.num_obj, 
-            is_training=True, name='obj_cls', 
-            hidden_layers=self.args.fc_cls)
-        prob_pos_O = tf.nn.softmax(score_pos_O, 1)
-        
-        loss = self.cross_entropy(prob_pos_O, self.pos_obj_id, 
-            depth=self.num_obj, weight=self.obj_weight)
-
-
-        ################################ test #################################
-        
-        score_pos_O = self.MLP(self.pos_image_feat, self.num_obj,
-            is_training=False, name='obj_cls', 
-            hidden_layers=self.args.fc_cls)
-        prob_pos_O = tf.nn.softmax(score_pos_O, 1)
-
-        batchsize = tf.shape(self.pos_image_feat)[0]
-        prob_pos_A = tf.zeros([batchsize, self.num_attr],
-            dtype=self.pos_image_feat.dtype)
-        score_original = tf.zeros([batchsize, self.num_pair],
-            dtype=self.pos_image_feat.dtype)
+        # 推理阶段结构
+        prob_pos_A = torch.zeros(batch_size, self.num_attr, device=input_feats.device)
+        score_original = torch.zeros(batch_size, self.num_pair, device=input_feats.device)
 
         score_res = OrderedDict([
             ("score_fc", [score_original, prob_pos_A, prob_pos_O]),
         ])
-        
 
-        # summary
-        
-        with tf.device("/cpu:0"):
-            tf.summary.scalar('loss_total', loss)
-            tf.summary.scalar('lr', self.lr)
-            
-        
-        train_summary_op = tf.summary.merge_all()
-
-
-        if test_only:
-            return prob_pos_O
+        if not test_only:
+            return (loss, score_res)
         else:
-            return loss, score_res, train_summary_op
+            batch_size = input_feats.size(0)
+            prob_pos_A = torch.zeros(batch_size, self.num_attr, device=input_feats.device)
+            score_original = torch.zeros(batch_size, self.num_pair, device=input_feats.device)
 
+            score_res = OrderedDict([
+                ("score_fc", [score_original, prob_pos_A, prob_pos_O]),
+            ])
+            return score_res
 
+    def train_step(self, input_feats, obj_labels, optimizer=None, writer=None, global_step=0):
+        """
+        input_feats: (B, feat_dim)
+        obj_labels: (B,)
+        optimizer: torch.optim
+        """
+        self.train()
+        loss, _ = self.build_network(input_feats, obj_labels, test_only=False)
 
-    def train_step(self, sess, blobs, lr, train_op, train_summary_op):
-        summary, _ = sess.run(
-            [train_summary_op, train_op],
-            feed_dict={
-                self.pos_obj_id      : blobs[2],
-                self.pos_image_feat  : blobs[9],
-                self.lr: lr,
-            })
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        return summary
+        if writer is not None:
+            writer.add_scalar("loss_total", loss.item(), global_step)
 
-    def test_step_no_postprocess(self, sess, blobs, score_op):
-        score = sess.run(
-            score_op,
-            feed_dict={
-                self.pos_image_feat: blobs[4],
-            })
+        return loss.item()
 
-        return score
+    def test_step_no_postprocess(self, input_feats):
+        """
+        input_feats: (B, feat_dim)
+        return: dict of scores
+        """
+        self.eval()
+        with torch.no_grad():
+            score_res = self.build_network(input_feats, test_only=True)
+        return score_res

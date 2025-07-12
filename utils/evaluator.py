@@ -37,49 +37,103 @@ class CZSL_Evaluator:
 
 
     # generate masks for each setting, mask scores, and get prediction labels    
-    def generate_predictions(self, scores, obj_truth): # (B, #pairs)
+    # def generate_predictions(self, scores, obj_truth): # (B, #pairs)
+    #
+    #     def get_pred_from_scores(_scores):
+    #         _, pair_pred = _scores.max(1)
+    #         attr_pred, obj_pred = self.pairs[pair_pred][:,0], self.pairs[pair_pred][:,1]
+    #         return (attr_pred, obj_pred)  # attr/obj word id (not name)
+    #
+    #     def get_pred_from_scores_and_mask_best(_scores):
+    #         _, pair_pred = _scores.max(1)
+    #         attr_pred, obj_pred = self.pairs[pair_pred][:,0], self.pairs[pair_pred][:,1]
+    #         _scores[range(pair_pred.shape[0]),pair_pred] = -1e10
+    #         return _scores, (attr_pred, obj_pred)  # attr/obj word id (not name)
+    #
+    #     results = {}
+    #
+    #     # open world setting -- no mask
+    #     results.update({'open': get_pred_from_scores(scores)})
+    #
+    #
+    #     # closed world setting - set the score for all NON test-pairs to -1e10
+    #     mask = self.closed_mask.repeat(scores.shape[0], 1)
+    #     closed_scores = scores.clone()
+    #     if hasattr(mask, 'bool'):
+    #         closed_scores[(1-mask).bool()] = -1e10
+    #     else:
+    #         closed_scores[(1-mask).byte()] = -1e10
+    #     closed_scores, closed1 = get_pred_from_scores_and_mask_best(closed_scores)
+    #     results.update({'closed1': closed1})
+    #     closed_scores, closed2 = get_pred_from_scores_and_mask_best(closed_scores)
+    #     results.update({'closed2': closed2})
+    #     closed_scores, closed3 = get_pred_from_scores_and_mask_best(closed_scores)
+    #     results.update({'closed3': closed3})
+    #
+    #
+    #     # object_oracle setting - set the score to -1e10 for all pairs where the true object does NOT participate
+    #     mask = self.oracle_obj_mask[obj_truth]
+    #     oracle_obj_scores = scores.clone()
+    #     if hasattr(mask, 'bool'):
+    #         oracle_obj_scores[(1-mask).bool()] = -1e10
+    #     else:
+    #         oracle_obj_scores[(1-mask).byte()] = -1e10
+    #
+    #     results.update({'object_oracle': get_pred_from_scores(oracle_obj_scores)})
+    #
+    #     return results
+
+    def generate_predictions(self, scores, obj_truth):  # (B, #pairs) or (#pairs,)
 
         def get_pred_from_scores(_scores):
+            if _scores.dim() == 1:
+                _scores = _scores.unsqueeze(0)  # shape: [1, num_pairs]
             _, pair_pred = _scores.max(1)
-            attr_pred, obj_pred = self.pairs[pair_pred][:,0], self.pairs[pair_pred][:,1]
-            return (attr_pred, obj_pred)  # attr/obj word id (not name)
+            attr_pred = self.pairs[pair_pred][:, 0]
+            obj_pred = self.pairs[pair_pred][:, 1]
+            return (attr_pred, obj_pred)
 
         def get_pred_from_scores_and_mask_best(_scores):
+            if _scores.dim() == 1:
+                _scores = _scores.unsqueeze(0)
             _, pair_pred = _scores.max(1)
-            attr_pred, obj_pred = self.pairs[pair_pred][:,0], self.pairs[pair_pred][:,1]
-            _scores[range(pair_pred.shape[0]),pair_pred] = -1e10
-            return _scores, (attr_pred, obj_pred)  # attr/obj word id (not name)
+            attr_pred = self.pairs[pair_pred][:, 0]
+            obj_pred = self.pairs[pair_pred][:, 1]
+            _scores[torch.arange(pair_pred.shape[0]), pair_pred] = -1e10
+            return _scores, (attr_pred, obj_pred)
+
+        def apply_mask(score_tensor, mask_tensor):
+            score_tensor = score_tensor.clone()
+            if score_tensor.dim() == 1:
+                mask_tensor = mask_tensor.squeeze()
+                if mask_tensor.dim() == 2:
+                    mask_tensor = mask_tensor[0]  # 只取一行
+                score_tensor[mask_tensor == 0] = -1e10
+            else:
+                score_tensor[mask_tensor == 0] = -1e10
+            return score_tensor
 
         results = {}
 
-        # open world setting -- no mask
-        results.update({'open': get_pred_from_scores(scores)})
+        # open world setting
+        results['open'] = get_pred_from_scores(scores)
 
-
-        # closed world setting - set the score for all NON test-pairs to -1e10
-        mask = self.closed_mask.repeat(scores.shape[0], 1)
-        closed_scores = scores.clone()
-        if hasattr(mask, 'bool'):
-            closed_scores[(1-mask).bool()] = -1e10
+        # closed world setting
+        if scores.dim() == 1:
+            mask = self.closed_mask.unsqueeze(0)  # [1, num_pairs]
         else:
-            closed_scores[(1-mask).byte()] = -1e10
-        closed_scores, closed1 = get_pred_from_scores_and_mask_best(closed_scores)
-        results.update({'closed1': closed1})
-        closed_scores, closed2 = get_pred_from_scores_and_mask_best(closed_scores)
-        results.update({'closed2': closed2})
-        closed_scores, closed3 = get_pred_from_scores_and_mask_best(closed_scores)
-        results.update({'closed3': closed3})
+            mask = self.closed_mask.repeat(scores.size(0), 1)  # [B, num_pairs]
 
+        closed_scores = apply_mask(scores, mask)
+        closed_scores, results['closed1'] = get_pred_from_scores_and_mask_best(closed_scores)
+        closed_scores, results['closed2'] = get_pred_from_scores_and_mask_best(closed_scores)
+        closed_scores, results['closed3'] = get_pred_from_scores_and_mask_best(closed_scores)
 
-        # object_oracle setting - set the score to -1e10 for all pairs where the true object does NOT participate
-        mask = self.oracle_obj_mask[obj_truth]
-        oracle_obj_scores = scores.clone()
-        if hasattr(mask, 'bool'):
-            oracle_obj_scores[(1-mask).bool()] = -1e10
-        else:
-            oracle_obj_scores[(1-mask).byte()] = -1e10
+        # object-oracle setting
+        oracle_mask = self.oracle_obj_mask[obj_truth]
+        oracle_scores = apply_mask(scores, oracle_mask)
 
-        results.update({'object_oracle': get_pred_from_scores(oracle_obj_scores)})
+        results['object_oracle'] = get_pred_from_scores(oracle_scores)
 
         return results
 
@@ -93,7 +147,7 @@ class CZSL_Evaluator:
         scores = torch.stack([
             scores[(self.dset.attr2idx[attr], self.dset.obj2idx[obj])]
             for attr, obj in self.dset.pairs
-        ], 1) # (B, #pairs)
+        ], 0) # (B, #pairs)
         results = self.generate_predictions(scores, obj_truth)
         return results
 
@@ -128,8 +182,23 @@ class CZSL_Evaluator:
         return attr_match, obj_match, closed_1_match, closed_2_match, closed_3_match, open_match, obj_oracle_match
 
     
+    # def evaluate_only_attr_obj(self, prob_a, gt_a, prob_o, gt_o):
+    #     prob_a, prob_o = torch.from_numpy(prob_a), torch.from_numpy(prob_o)
+    #     _, pred_a = prob_a.max(1)
+    #     _, pred_o = prob_o.max(1)
+    #
+    #     attr_match = (pred_a == gt_a).float()
+    #     obj_match = (pred_o == gt_o).float()
+    #
+    #     return attr_match, obj_match
+
     def evaluate_only_attr_obj(self, prob_a, gt_a, prob_o, gt_o):
-        prob_a, prob_o = torch.from_numpy(prob_a), torch.from_numpy(prob_o)
+        # 如果prob_a/prob_o是numpy数组，转成Tensor；否则直接用
+        if not isinstance(prob_a, torch.Tensor):
+            prob_a = torch.from_numpy(prob_a)
+        if not isinstance(prob_o, torch.Tensor):
+            prob_o = torch.from_numpy(prob_o)
+
         _, pred_a = prob_a.max(1)
         _, pred_o = prob_o.max(1)
 
@@ -137,11 +206,6 @@ class CZSL_Evaluator:
         obj_match = (pred_o == gt_o).float()
 
         return attr_match, obj_match
-
-
-
-
-
 
 
 class GCZSL_Evaluator:

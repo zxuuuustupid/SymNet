@@ -1,8 +1,19 @@
 from .. import config as cfg
-import CZSL_dataset, GCZSL_dataset
+from utils.dataset import CZSL_dataset, GCZSL_dataset, Multi_dataset
 from torch.utils.data import DataLoader
 import numpy as np
-import Multi_dataset
+# import Multi_dataset
+
+import torch
+
+def custom_collate_fn(data):
+    result = []
+    for d in zip(*data):
+        if any(x is None for x in d):
+            result.append(None)
+        else:
+            result.append(torch.stack([torch.tensor(x) for x in d], dim=0))
+    return result
 
 def get_dataloader(dataset_name, phase, feature_file="features.t7", batchsize=1, num_workers=1, shuffle=None,args=None, **kwargs):
     
@@ -33,7 +44,7 @@ def get_dataloader(dataset_name, phase, feature_file="features.t7", batchsize=1,
         shuffle = (phase=='train')
     
     return DataLoader(dataset, batchsize, shuffle, num_workers=num_workers,
-        collate_fn = lambda data: [np.stack(d, axis=0) for d in zip(*data)]
+        collate_fn = custom_collate_fn
     )
 
 

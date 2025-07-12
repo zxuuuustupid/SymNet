@@ -18,8 +18,8 @@ DATA_ROOT_DIR         = ROOT_DIR+"/data"
 
 
 CZSL_DS_ROOT = {
-    'MIT': DATA_ROOT_DIR+'/mit-states-original',
-    'UT':  DATA_ROOT_DIR+'/ut-zap50k-original',
+    'MIT': DATA_ROOT_DIR+'/mit-states-natural',
+    'UT':  DATA_ROOT_DIR+'/ut-zap50k-natural',
 }
 
 GCZSL_DS_ROOT = {
