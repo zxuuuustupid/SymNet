@@ -74,7 +74,7 @@ These are commands for the split and evaluation metrics introduced by [1].
 
 Before training a SymNet model, train an object classifier by running:
 
-	python run_symnet.py --network fc_obj --name MIT_obj_lr3e-3 --data MIT --epoch 1500 --batchnorm --lr 3e-3
+	python run_symnet.py --network fc_obj --name UT_obj_lr1e-3 --data UT --epoch 300 --batchnorm --lr 1e-3 --force
 	python run_symnet.py --network fc_obj --name UT_obj_lr1e-3 --data UT --epoch 300 --batchnorm --lr 1e-3
 
 Then store the intermediate object results:
