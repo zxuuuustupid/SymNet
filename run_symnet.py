@@ -244,7 +244,7 @@ class SolverWrapper(BaseSolver):
             print(f"Best    {name}: {utils.formated_czsl_result(self.best_report[name])}")
 
     def snapshot(self, epoch):
-        torch.save(self.network.state_dict(), osp.join(self.weight_dir, f"model_{epoch}.pth"))
+        torch.save(self.network.state_dict(), osp.join(self.weight_dir, f"snapshot_epoch_{epoch}.pth"))
 
 if __name__ == "__main__":
     main()

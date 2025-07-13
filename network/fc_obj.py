@@ -79,6 +79,7 @@ class Network(BaseNetwork):
         input_feats: (B, feat_dim)
         return: dict of scores
         """
+
         self.eval()
         with torch.no_grad():
             score_res = self.build_network(input_feats, test_only=True)
